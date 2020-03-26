@@ -3,39 +3,73 @@
 #include <U8g2lib.h>
 #include <Wire.h>
 #include "bsec.h"
+#include <EEPROM.h>
 
 // Helper functions declarations
 void checkIaqSensorStatus(void);
 void errLeds(void);
+void loadState(void);
+void updateState(void);
+
+const uint8_t bsec_config_iaq[] = {
+  #include "config/ /bsec_iaq.txt"
+};
+#define STATE_SAVE_PERIOD	UINT32_C(360 * 60 * 1000) // 360 minutes - 4 times a day
 
 // Create an object of the class Bsec
 Bsec iaqSensor;
+uint8_t bsecState[BSEC_MAX_STATE_BLOB_SIZE] = {0};
+uint16_t stateUpdateCounter = 0;
 
 String output;
 
 int displayUpdateCount = 0;
+int counter = 0;
 
 
+String uint64ToString(uint64_t input) {
+  String result = "";
+  uint8_t base = 10;
+
+  do {
+    char c = input % base;
+    input /= base;
+
+    if (c < 10)
+      c +='0';
+    else
+      c += 'A' - 10;
+    result = c + result;
+  } while (input);
+  return result;
+}
 U8G2_SSD1306_128X64_NONAME_F_SW_I2C u8g2(U8G2_R0, 15, 4, 16);
 void setup()
 {
+    EEPROM.begin(BSEC_MAX_STATE_BLOB_SIZE + 1); // 1st address for the length
     Serial.begin(115200);
 
     // Set WiFi to station mode and disconnect from an AP if it was previously connected
-    WiFi.mode(WIFI_STA);
-    WiFi.disconnect();
+    
+    WiFi.mode(WIFI_OFF);
     delay(100);
-
-    // u8g2.begin();
+    
+    Wire.begin();
+    u8g2.begin();
 
     Wire.begin(21,22);
+    
 
     iaqSensor.begin(BME680_I2C_ADDR_SECONDARY, Wire);
+    iaqSensor.setTemperatureOffset(0.7);
     output = "\nBSEC library version " + String(iaqSensor.version.major) + "." + String(iaqSensor.version.minor) + "." + String(iaqSensor.version.major_bugfix) + "." + String(iaqSensor.version.minor_bugfix);
     Serial.println(output);
     checkIaqSensorStatus();
 
-  bsec_virtual_sensor_t sensorList[10] = {
+    iaqSensor.setConfig(bsec_config_iaq);
+    checkIaqSensorStatus();
+    loadState();
+   bsec_virtual_sensor_t sensorList[10] = {
     BSEC_OUTPUT_RAW_TEMPERATURE,
     BSEC_OUTPUT_RAW_PRESSURE,
     BSEC_OUTPUT_RAW_HUMIDITY,
@@ -67,33 +101,28 @@ void displayText(String text1, String text2, String text3) {
 }
 
 
-String CalculateIAQ(float score){
-  String IAQ_text = "Air Quality: ";
-  score = (100-score)*5;
-  if      (score >= 301)                  IAQ_text += "Hazardous";
-  else if (score >= 201 && score <= 300 ) IAQ_text += "Very Unhealthy";
-  else if (score >= 176 && score <= 200 ) IAQ_text += "Unhealthy";
-  else if (score >= 151 && score <= 175 ) IAQ_text += "Unhealthy for Sensitive Groups";
-  else if (score >=  51 && score <= 150 ) IAQ_text += "Moderate";
-  else if (score >=  00 && score <=  50 ) IAQ_text += "Good";
-  return IAQ_text;
-}
+
 void loop() {
-    unsigned long time_trigger = millis();
+  unsigned long time_trigger = millis();
   if (iaqSensor.run()) { // If new data is available
     output = String(time_trigger);
     output += ", " + String(iaqSensor.rawTemperature);
     output += ", " + String(iaqSensor.pressure);
     output += ", " + String(iaqSensor.rawHumidity);
     output += ", " + String(iaqSensor.gasResistance);
-    output += ", " + String(iaqSensor.iaq);
-    output += ", " + String(iaqSensor.iaqAccuracy);
+    output += ",i: " + String(iaqSensor.iaq);
+    output += ",iA: " + String(iaqSensor.iaqAccuracy);
     output += ", " + String(iaqSensor.temperature);
     output += ", " + String(iaqSensor.humidity);
-    output += ", " + String(iaqSensor.staticIaq);
-    output += ", " + String(iaqSensor.co2Equivalent);
-    output += ", " + String(iaqSensor.breathVocEquivalent);
+    output += ",sI " + String(iaqSensor.staticIaq);
+    output += ",co2: " + String(iaqSensor.co2Equivalent);
+    output += ",voc: " + String(iaqSensor.breathVocEquivalent);
     Serial.println(output);
+    if(counter % 4 == 0)
+      displayText(String(iaqSensor.temperature)+" C", String(iaqSensor.iaq)+ " Q: "+String(iaqSensor.iaqAccuracy) , String(iaqSensor.co2Equivalent)+" co2 "+String(iaqSensor.breathVocEquivalent)+" voc");
+    counter++;
+    updateState();
+    Serial.println("next: "+uint64ToString(iaqSensor.nextCall));
   } else {
     checkIaqSensorStatus();
   }
@@ -131,4 +160,61 @@ void errLeds(void)
 {
  Serial.println("Error");
  delay(5000);
+}
+
+
+void loadState(void)
+{
+  if (EEPROM.read(0) == BSEC_MAX_STATE_BLOB_SIZE) {
+    // Existing state in EEPROM
+    Serial.println(">>>>>>>>>Reading state from EEPROM");
+
+    for (uint8_t i = 0; i < BSEC_MAX_STATE_BLOB_SIZE; i++) {
+      bsecState[i] = EEPROM.read(i + 1);
+      Serial.println(bsecState[i], HEX);
+    }
+
+    iaqSensor.setState(bsecState);
+    checkIaqSensorStatus();
+  } else {
+    // Erase the EEPROM with zeroes
+    Serial.println(">>>>>>>>>Erasing EEPROM");
+
+    for (uint8_t i = 0; i < BSEC_MAX_STATE_BLOB_SIZE + 1; i++)
+      EEPROM.write(i, 0);
+
+    EEPROM.commit();
+  }
+}
+void updateState(void)
+{
+  bool update = false;
+  /* Set a trigger to save the state. Here, the state is saved every STATE_SAVE_PERIOD with the first state being saved once the algorithm achieves full calibration, i.e. iaqAccuracy = 3 */
+  if (stateUpdateCounter == 0) {
+    if (iaqSensor.iaqAccuracy >= 3) {
+      update = true;
+      stateUpdateCounter++;
+    }
+  } else {
+    /* Update every STATE_SAVE_PERIOD milliseconds */
+    if ((stateUpdateCounter * STATE_SAVE_PERIOD) < millis()) {
+      update = true;
+      stateUpdateCounter++;
+    }
+  }
+
+  if (update) {
+    iaqSensor.getState(bsecState);
+    checkIaqSensorStatus();
+
+    Serial.println(">>>>>>>>>Writing state to EEPROM");
+
+    for (uint8_t i = 0; i < BSEC_MAX_STATE_BLOB_SIZE ; i++) {
+      EEPROM.write(i + 1, bsecState[i]);
+      Serial.println(bsecState[i], HEX);
+    }
+
+    EEPROM.write(0, BSEC_MAX_STATE_BLOB_SIZE);
+    EEPROM.commit();
+  }
 }
