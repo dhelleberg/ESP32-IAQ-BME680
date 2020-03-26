@@ -2,163 +2,275 @@
 #include "WiFi.h"
 #include <U8g2lib.h>
 #include <Wire.h>
-#include <SPI.h>
-#include <Adafruit_Sensor.h>
-#include "Adafruit_BME680.h"
+#include "bsec.h"
+#include <EEPROM.h>
+#include <MQTT.h>
+#include <updater.h>
 
-#define BME_SCK 13
-#define BME_MISO 12
-#define BME_MOSI 11
-#define BME_CS 10
+/*Put your SSID & Password*/
+const char *ssid = WSSID;    // Enter SSID here
+const char *password = WPWD; //Enter Password here
 
-#define SEALEVELPRESSURE_HPA (1013.25)
+const int WIFI_TIMEOUT_RESTART_S = 60;
 
-Adafruit_BME680 bme; // I2C
-float hum_weighting = 0.25; // so hum effect is 25% of the total air quality score
-float gas_weighting = 0.75; // so gas effect is 75% of the total air quality score
+// Helper functions declarations
+void checkIaqSensorStatus(void);
+void errLeds(void);
+void loadState(void);
+void updateState(void);
 
-float hum_score, gas_score;
-float gas_reference = 250000;
-float hum_reference = 40;
-int getgasreference_count = 0;
+const uint8_t bsec_config_iaq[] = {
+#include "config/generic_33v_3s_28d/bsec_iaq.txt"
+};
+#define STATE_SAVE_PERIOD UINT32_C(360 * 60 * 1000) // 360 minutes - 4 times a day
+
+// Create an object of the class Bsec
+Bsec iaqSensor;
+uint8_t bsecState[BSEC_MAX_STATE_BLOB_SIZE] = {0};
+uint16_t stateUpdateCounter = 0;
+
+String output;
+
 int displayUpdateCount = 0;
+int counter = 0;
 
+long lastUpdateCheck =  0;
+long lastReconnect =  0;
 
-U8G2_SSD1306_128X64_NONAME_F_SW_I2C u8g2(U8G2_R0, 15, 4, 16);
+WiFiClient net;
+MQTTClient client;
 
-void GetGasReference(){
-  // Now run the sensor for a burn-in period, then use combination of relative humidity and gas resistance to estimate indoor air quality as a percentage.
-  Serial.println("Getting a new gas reference value");
-  int readings = 10;
-  for (int i = 1; i <= readings; i++){ // read gas for 10 x 0.150mS = 1.5secs
-    gas_reference += bme.readGas();
-  }
-  gas_reference = gas_reference / readings;
+String uint64ToString(uint64_t input)
+{
+  String result = "";
+  uint8_t base = 10;
+
+  do
+  {
+    char c = input % base;
+    input /= base;
+
+    if (c < 10)
+      c += '0';
+    else
+      c += 'A' - 10;
+    result = c + result;
+  } while (input);
+  return result;
 }
-
+U8G2_SSD1306_128X64_NONAME_F_SW_I2C u8g2(U8G2_R0, 15, 4, 16);
 void setup()
 {
-    Serial.begin(115200);
+  EEPROM.begin(BSEC_MAX_STATE_BLOB_SIZE + 1); // 1st address for the length
+  Serial.begin(115200);
 
-    // Set WiFi to station mode and disconnect from an AP if it was previously connected
-    WiFi.mode(WIFI_STA);
-    WiFi.disconnect();
-    delay(100);
+  // Set WiFi to station mode and disconnect from an AP if it was previously connected
 
-    u8g2.begin();
+  // Start Wifi connection
+  WiFi.mode(WIFI_OFF);
+  WiFi.setSleep(false);
 
-    Wire.begin();
-    if (!bme.begin()) {
-        Serial.println("Could not find a valid BME680 sensor, check wiring!");
-        while (1);
-    } else Serial.println("Found a sensor");
-    u8g2.clearBuffer();
-    u8g2.setFont(u8g_font_helvB10);
-    u8g2.drawStr(0, 20, "setting up...");
+  WiFi.begin(ssid, password);
+  Serial.print("[WIFI] Connecting to WiFi ");
 
-    // Set up oversampling and filter initialization
-    bme.setTemperatureOversampling(BME680_OS_2X);
-    bme.setHumidityOversampling(BME680_OS_2X);
-    bme.setPressureOversampling(BME680_OS_2X);
-    bme.setIIRFilterSize(BME680_FILTER_SIZE_3);
-    bme.setGasHeater(320, 150); // 320°C for 150 ms
-    // Now run the sensor for a burn-in period, then use combination of relative humidity and gas resistance to estimate indoor air quality as a percentage.
-    GetGasReference();
-
-    Serial.println("Setup done");
-}
-
-void displayText(String text1, String text2, String text3) {
-    u8g2.clearBuffer();
-    u8g2.setFont(u8g_font_helvB10);
-    u8g2.drawStr(0, 20, text1.c_str());
-    u8g2.drawStr(0, 40, text2.c_str());
-    u8g2.drawStr(0, 60, text3.c_str());
-
-    u8g2.sendBuffer();
-}
-
-
-String CalculateIAQ(float score){
-  String IAQ_text = "Air Quality: ";
-  score = (100-score)*5;
-  if      (score >= 301)                  IAQ_text += "Hazardous";
-  else if (score >= 201 && score <= 300 ) IAQ_text += "Very Unhealthy";
-  else if (score >= 176 && score <= 200 ) IAQ_text += "Unhealthy";
-  else if (score >= 151 && score <= 175 ) IAQ_text += "Unhealthy for Sensitive Groups";
-  else if (score >=  51 && score <= 150 ) IAQ_text += "Moderate";
-  else if (score >=  00 && score <=  50 ) IAQ_text += "Good";
-  return IAQ_text;
-}
-void loop() {
-    // Wait a bit before scanning again
-    if (! bme.performReading()) {
-        Serial.println("Failed to perform reading :(");
-        return;
+  int wifi_connection_time = 0;
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    delay(1000);
+    Serial.print(".");
+    wifi_connection_time++;
+    if (wifi_connection_time > WIFI_TIMEOUT_RESTART_S)
+    {
+      Serial.println("[WIFI] Run into Wifi Timeout, try restart");
+      Serial.flush();
+      WiFi.disconnect();
+      ESP.restart();
     }
-    Serial.print("Temperature = ");
-    Serial.print(bme.temperature);
-    Serial.println(" *C");
+  }
+  Serial.println("\n[WIFI] Connected");
+  lastReconnect = millis();
+  Updater::check_for_update();
+  Wire.begin();
+  u8g2.begin();
 
-    Serial.print("Pressure = ");
-    Serial.print(bme.pressure / 100.0);
-    Serial.println(" hPa");
+  Wire.begin(21, 22);
 
-    Serial.print("Humidity = ");
-    Serial.print(bme.humidity);
-    Serial.println(" %");
+  iaqSensor.begin(BME680_I2C_ADDR_SECONDARY, Wire);
+  iaqSensor.setTemperatureOffset(0.7);
+  output = "\nBSEC library version " + String(iaqSensor.version.major) + "." + String(iaqSensor.version.minor) + "." + String(iaqSensor.version.major_bugfix) + "." + String(iaqSensor.version.minor_bugfix);
+  Serial.println(output);
+  checkIaqSensorStatus();
 
-    Serial.print("Gas = ");
-    Serial.print(bme.gas_resistance / 1000.0);
-    Serial.println(" KOhms");
+  iaqSensor.setConfig(bsec_config_iaq);
+  checkIaqSensorStatus();
+  loadState();
+  bsec_virtual_sensor_t sensorList[10] = {
+      BSEC_OUTPUT_RAW_TEMPERATURE,
+      BSEC_OUTPUT_RAW_PRESSURE,
+      BSEC_OUTPUT_RAW_HUMIDITY,
+      BSEC_OUTPUT_RAW_GAS,
+      BSEC_OUTPUT_IAQ,
+      BSEC_OUTPUT_STATIC_IAQ,
+      BSEC_OUTPUT_CO2_EQUIVALENT,
+      BSEC_OUTPUT_BREATH_VOC_EQUIVALENT,
+      BSEC_OUTPUT_SENSOR_HEAT_COMPENSATED_TEMPERATURE,
+      BSEC_OUTPUT_SENSOR_HEAT_COMPENSATED_HUMIDITY,
+  };
 
-    Serial.print("Approx. Altitude = ");
-    Serial.print(bme.readAltitude(SEALEVELPRESSURE_HPA));
-    Serial.println(" m");
+  iaqSensor.updateSubscription(sensorList, 10, BSEC_SAMPLE_RATE_LP);
+  checkIaqSensorStatus();
 
-    
-    //Calculate humidity contribution to IAQ index
-  float current_humidity = bme.readHumidity();
-  if (current_humidity >= 38 && current_humidity <= 42)
-    hum_score = 0.25*100; // Humidity +/-5% around optimum 
+  // Print the header
+  output = "Timestamp [ms], raw temperature [°C], pressure [hPa], raw relative humidity [%], gas [Ohm], IAQ, IAQ accuracy, temperature [°C], relative humidity [%], Static IAQ, CO2 equivalent, breath VOC equivalent";
+  Serial.println(output);
+}
+
+void displayText(String text1, String text2, String text3)
+{
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g_font_helvB10);
+  u8g2.drawStr(0, 20, text1.c_str());
+  u8g2.drawStr(0, 40, text2.c_str());
+  u8g2.drawStr(0, 60, text3.c_str());
+
+  u8g2.sendBuffer();
+}
+
+void loop()
+{
+  unsigned long time_trigger = millis();
+  if (iaqSensor.run())
+  { // If new data is available
+    output = String(time_trigger);
+    output += ", " + String(iaqSensor.rawTemperature);
+    output += ", " + String(iaqSensor.pressure);
+    output += ", " + String(iaqSensor.rawHumidity);
+    output += ", " + String(iaqSensor.gasResistance);
+    output += ",i: " + String(iaqSensor.iaq);
+    output += ",iA: " + String(iaqSensor.iaqAccuracy);
+    output += ", " + String(iaqSensor.temperature);
+    output += ", " + String(iaqSensor.humidity);
+    output += ",sI " + String(iaqSensor.staticIaq);
+    output += ",co2: " + String(iaqSensor.co2Equivalent);
+    output += ",voc: " + String(iaqSensor.breathVocEquivalent);
+    Serial.println(output);
+    if (counter % 4 == 0)
+      displayText(String(iaqSensor.temperature) + " C", String(iaqSensor.iaq) + " Q: " + String(iaqSensor.iaqAccuracy), String(iaqSensor.co2Equivalent) + " co2 " + String(iaqSensor.breathVocEquivalent) + " voc");
+    counter++;
+    updateState();
+    Serial.println("next: " + uint64ToString(iaqSensor.nextCall));
+  }
   else
-  { //sub-optimal
-    if (current_humidity < 38) 
-      hum_score = 0.25/hum_reference*current_humidity*100;
+  {
+    checkIaqSensorStatus();
+  }
+}
+
+// Helper function definitions
+void checkIaqSensorStatus(void)
+{
+  if (iaqSensor.status != BSEC_OK)
+  {
+    if (iaqSensor.status < BSEC_OK)
+    {
+      output = "Sensor BSEC error code : " + String(iaqSensor.status);
+      Serial.println(output);
+      for (;;)
+        errLeds(); /* Halt in case of failure */
+    }
     else
     {
-      hum_score = ((-0.25/(100-hum_reference)*current_humidity)+0.416666)*100;
+      output = "Sensor BSEC warning code : " + String(iaqSensor.status);
+      Serial.println(output);
     }
   }
-  
-  //Calculate gas contribution to IAQ index
-  float gas_lower_limit = 5000;   // Bad air quality limit
-  float gas_upper_limit = 50000;  // Good air quality limit 
-  if (gas_reference > gas_upper_limit) gas_reference = gas_upper_limit; 
-  if (gas_reference < gas_lower_limit) gas_reference = gas_lower_limit;
-  gas_score = (0.75/(gas_upper_limit-gas_lower_limit)*gas_reference -(gas_lower_limit*(0.75/(gas_upper_limit-gas_lower_limit))))*100;
-  
-  //Combine results for the final IAQ index value (0-100% where 100% is good quality air)
-  float air_quality_score = hum_score + gas_score;
 
-  Serial.println("Air Quality = "+String(air_quality_score,1)+"% derived from 25% of Humidity reading and 75% of Gas reading - 100% is good quality air");
-  Serial.println("Humidity element was : "+String(hum_score/100)+" of 0.25");
-  Serial.println("     Gas element was : "+String(gas_score/100)+" of 0.75");
-  if (bme.readGas() < 120000) Serial.println("***** Poor air quality *****");
-  Serial.println();
-  if ((getgasreference_count++)%10==0) GetGasReference(); 
-  Serial.println(CalculateIAQ(air_quality_score));
-  Serial.println("------------------------------------------------");
-  if(displayUpdateCount >= 2) {
-    displayText("temp: "+String(bme.temperature,2), "pressure: "+String(bme.pressure / 100,0), CalculateIAQ(air_quality_score));
-    displayUpdateCount = 0;
+  if (iaqSensor.bme680Status != BME680_OK)
+  {
+    if (iaqSensor.bme680Status < BME680_OK)
+    {
+      output = "BME680 error code : " + String(iaqSensor.bme680Status);
+      Serial.println(output);
+      for (;;)
+        errLeds(); /* Halt in case of failure */
+    }
+    else
+    {
+      output = "BME680 warning code : " + String(iaqSensor.bme680Status);
+      Serial.println(output);
+    }
   }
-  displayUpdateCount++;
-  delay(4000);
-
-        
 }
 
+void errLeds(void)
+{
+  Serial.println("Error");
+  delay(5000);
+}
 
+void loadState(void)
+{
+  if (EEPROM.read(0) == BSEC_MAX_STATE_BLOB_SIZE)
+  {
+    // Existing state in EEPROM
+    Serial.println(">>>>>>>>>Reading state from EEPROM");
 
+    for (uint8_t i = 0; i < BSEC_MAX_STATE_BLOB_SIZE; i++)
+    {
+      bsecState[i] = EEPROM.read(i + 1);
+      Serial.println(bsecState[i], HEX);
+    }
 
+    iaqSensor.setState(bsecState);
+    checkIaqSensorStatus();
+  }
+  else
+  {
+    // Erase the EEPROM with zeroes
+    Serial.println(">>>>>>>>>Erasing EEPROM");
+
+    for (uint8_t i = 0; i < BSEC_MAX_STATE_BLOB_SIZE + 1; i++)
+      EEPROM.write(i, 0);
+
+    EEPROM.commit();
+  }
+}
+void updateState(void)
+{
+  bool update = false;
+  /* Set a trigger to save the state. Here, the state is saved every STATE_SAVE_PERIOD with the first state being saved once the algorithm achieves full calibration, i.e. iaqAccuracy = 3 */
+  if (stateUpdateCounter == 0)
+  {
+    if (iaqSensor.iaqAccuracy >= 3)
+    {
+      update = true;
+      stateUpdateCounter++;
+    }
+  }
+  else
+  {
+    /* Update every STATE_SAVE_PERIOD milliseconds */
+    if ((stateUpdateCounter * STATE_SAVE_PERIOD) < millis())
+    {
+      update = true;
+      stateUpdateCounter++;
+    }
+  }
+
+  if (update)
+  {
+    iaqSensor.getState(bsecState);
+    checkIaqSensorStatus();
+
+    Serial.println(">>>>>>>>>Writing state to EEPROM");
+
+    for (uint8_t i = 0; i < BSEC_MAX_STATE_BLOB_SIZE; i++)
+    {
+      EEPROM.write(i + 1, bsecState[i]);
+      Serial.println(bsecState[i], HEX);
+    }
+
+    EEPROM.write(0, BSEC_MAX_STATE_BLOB_SIZE);
+    EEPROM.commit();
+  }
+}
