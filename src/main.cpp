@@ -10,6 +10,10 @@
 /*Put your SSID & Password*/
 const char *ssid = WSSID;    // Enter SSID here
 const char *password = WPWD; //Enter Password here
+const char *mqttprefix= MQTT_ID;
+
+const int UPDATE_INTERVAL = 60 * 1000 * 10; //every 10 min
+const int RECONNECT_INTERVAL = 30 * 1000;
 
 const int WIFI_TIMEOUT_RESTART_S = 60;
 
@@ -39,6 +43,7 @@ long lastReconnect =  0;
 
 WiFiClient net;
 MQTTClient client;
+U8G2_SSD1306_128X64_NONAME_F_SW_I2C u8g2(U8G2_R0, 15, 4, 16);
 
 String uint64ToString(uint64_t input)
 {
@@ -58,12 +63,28 @@ String uint64ToString(uint64_t input)
   } while (input);
   return result;
 }
-U8G2_SSD1306_128X64_NONAME_F_SW_I2C u8g2(U8G2_R0, 15, 4, 16);
+void displayText(String text1, String text2, String text3)
+{
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g_font_helvB10);
+  u8g2.drawStr(0, 20, text1.c_str());
+  u8g2.drawStr(0, 40, text2.c_str());
+  u8g2.drawStr(0, 60, text3.c_str());
+
+  u8g2.sendBuffer();
+}
+
+
 void setup()
 {
   EEPROM.begin(BSEC_MAX_STATE_BLOB_SIZE + 1); // 1st address for the length
   Serial.begin(115200);
+  Wire.begin();
+  u8g2.begin();
 
+  Wire.begin(21, 22);
+
+  displayText("init...","","");
   // Set WiFi to station mode and disconnect from an AP if it was previously connected
 
   // Start Wifi connection
@@ -72,7 +93,7 @@ void setup()
 
   WiFi.begin(ssid, password);
   Serial.print("[WIFI] Connecting to WiFi ");
-
+  displayText("init...","starting wifi","");
   int wifi_connection_time = 0;
   while (WiFi.status() != WL_CONNECTED)
   {
@@ -87,13 +108,10 @@ void setup()
       ESP.restart();
     }
   }
+  displayText("init...","connected","wait for sensor...");
   Serial.println("\n[WIFI] Connected");
   lastReconnect = millis();
   Updater::check_for_update();
-  Wire.begin();
-  u8g2.begin();
-
-  Wire.begin(21, 22);
 
   iaqSensor.begin(BME680_I2C_ADDR_SECONDARY, Wire);
   iaqSensor.setTemperatureOffset(0.7);
@@ -123,21 +141,63 @@ void setup()
   // Print the header
   output = "Timestamp [ms], raw temperature [°C], pressure [hPa], raw relative humidity [%], gas [Ohm], IAQ, IAQ accuracy, temperature [°C], relative humidity [%], Static IAQ, CO2 equivalent, breath VOC equivalent";
   Serial.println(output);
+
+  Serial.print("\n mqtt.. connecting...");
+  client.begin("192.168.178.21",net);
+  
+  while (!client.connect("esp-iaq", "try", "try")) {
+    Serial.print(".");
+    delay(1000);
+  }
+  client.publish(String(mqttprefix)+"fw-version", FIRMWARE_VERSION, true, 2);
+
+
+  Serial.println("\nconnected!");
 }
 
-void displayText(String text1, String text2, String text3)
-{
-  u8g2.clearBuffer();
-  u8g2.setFont(u8g_font_helvB10);
-  u8g2.drawStr(0, 20, text1.c_str());
-  u8g2.drawStr(0, 40, text2.c_str());
-  u8g2.drawStr(0, 60, text3.c_str());
-
-  u8g2.sendBuffer();
-}
 
 void loop()
 {
+  client.loop(); //loop mqtt client
+  //handle re-connects 
+  long now = millis();
+  if(now > (lastReconnect + RECONNECT_INTERVAL)) {
+    lastReconnect = now;
+    if(WiFi.status() != WL_CONNECTED)
+    {
+      Serial.println("WIFI re-connecting...");
+      int wifi_retry = 0;
+      while(WiFi.status() != WL_CONNECTED && wifi_retry < 5 ) {
+        wifi_retry++;
+        Serial.println("WiFi not connected. Try to reconnect");
+        WiFi.disconnect();
+        WiFi.mode(WIFI_OFF);
+        WiFi.mode(WIFI_STA);
+        WiFi.begin(ssid, password);
+        delay(100);
+      }
+    }
+    if (!client.connected()) {
+        Serial.println("mqtt client re-connecting...");
+        int tries = 0;
+        boolean repeat = true;
+        while (!client.connect("esp-iaq", "try", "try") && repeat) {
+          Serial.print(".");
+          delay(100);
+          tries++;
+          if(tries > 5)
+            repeat = false;
+        }
+    }
+  }
+  if(now > (lastUpdateCheck+UPDATE_INTERVAL)) {
+
+    Serial.println("checking for SW-Update");
+    Updater::check_for_update();
+    lastUpdateCheck = now;
+  }
+
+
   unsigned long time_trigger = millis();
   if (iaqSensor.run())
   { // If new data is available
@@ -154,8 +214,27 @@ void loop()
     output += ",co2: " + String(iaqSensor.co2Equivalent);
     output += ",voc: " + String(iaqSensor.breathVocEquivalent);
     Serial.println(output);
+
+    client.publish(String(mqttprefix)+"pressure", String(iaqSensor.pressure), true, 2);
+    client.publish(String(mqttprefix)+"gasResistance", String(iaqSensor.gasResistance), true, 2);
+    client.publish(String(mqttprefix)+"iaq", String(iaqSensor.iaq), true, 2);
+    client.publish(String(mqttprefix)+"iaqAccuracy", String(iaqSensor.iaqAccuracy), true, 2);
+    client.publish(String(mqttprefix)+"temperature", String(iaqSensor.temperature), true, 2);
+    client.publish(String(mqttprefix)+"humidity", String(iaqSensor.humidity), true, 2);
+    client.publish(String(mqttprefix)+"staticIaq", String(iaqSensor.staticIaq), true, 2);
+    client.publish(String(mqttprefix)+"staticIaqAccuracy", String(iaqSensor.staticIaqAccuracy), true, 2);
+    client.publish(String(mqttprefix)+"co2Equivalent", String(iaqSensor.co2Equivalent), true, 2);
+    client.publish(String(mqttprefix)+"breathVocEquivalent", String(iaqSensor.breathVocEquivalent), true, 2);
+    client.publish(String(mqttprefix)+"breathVocAccuracy", String(iaqSensor.breathVocAccuracy), true, 2);
+    client.publish(String(mqttprefix)+"co2Accuracy", String(iaqSensor.co2Accuracy), true, 2);
+    client.publish(String(mqttprefix)+"compGasAccuracy", String(iaqSensor.compGasAccuracy), true, 2);
+    client.publish(String(mqttprefix)+"compGasValue", String(iaqSensor.compGasValue), true, 2);
+    client.publish(String(mqttprefix)+"gasPercentage", String(iaqSensor.gasPercentage), true, 2);
+    client.publish(String(mqttprefix)+"gasPercentageAcccuracy", String(iaqSensor.gasPercentageAcccuracy), true, 2);
+    
+    
     if (counter % 4 == 0)
-      displayText(String(iaqSensor.temperature) + " C", String(iaqSensor.iaq) + " Q: " + String(iaqSensor.iaqAccuracy), String(iaqSensor.co2Equivalent) + " co2 " + String(iaqSensor.breathVocEquivalent) + " voc");
+      displayText(String(iaqSensor.temperature) + " C", String(iaqSensor.iaq) + " Q: " + String(iaqSensor.iaqAccuracy)+ " "+String(iaqSensor.staticIaq), String(iaqSensor.co2Equivalent) + " co2 ");
     counter++;
     updateState();
     Serial.println("next: " + uint64ToString(iaqSensor.nextCall));

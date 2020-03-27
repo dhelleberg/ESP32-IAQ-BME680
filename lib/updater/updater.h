@@ -9,7 +9,7 @@
 #define UPDATER_VERSION_URL \
   "http://192.168.178.21:81/ota-iaq.json"
 #define UPDATER_FIRMWARE_URL \
-  "http://192.168.178.21:81/firmware.bin"
+  "http://192.168.178.21:81/otq-iaq.bin"
 
 class Updater {
  public:
